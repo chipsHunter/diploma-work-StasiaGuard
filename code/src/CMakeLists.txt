@@ -4,6 +4,8 @@ add_library(vpn-core
     key_pair.cpp
     anti_replay.cpp
     tun_device.cpp
+    noise_handshake.cpp
+    session.cpp
 )
 
 target_include_directories(vpn-core PUBLIC ${PROJECT_SOURCE_DIR}/include)

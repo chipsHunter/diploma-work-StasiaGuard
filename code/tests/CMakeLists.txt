@@ -6,3 +6,6 @@ target_link_libraries(vpn-test-anti-replay PRIVATE vpn-core)
 
 add_executable(vpn-test-tun test_tun.cpp)
 target_link_libraries(vpn-test-tun PRIVATE vpn-core)
+
+add_executable(vpn-test-handshake test_handshake.cpp)
+target_link_libraries(vpn-test-handshake PRIVATE vpn-core)

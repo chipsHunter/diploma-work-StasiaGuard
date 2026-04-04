@@ -80,6 +80,7 @@ void CryptoEngine::hmac(uint8_t* output,
                         const uint8_t* data, size_t data_len) {
     crypto_auth_hmacsha256_state state;
     crypto_auth_hmacsha256_init(&state, key, key_len);
-    crypto_auth_hmacsha256_update(&state, data, data_len);
+    if (data_len > 0)
+        crypto_auth_hmacsha256_update(&state, data, data_len);
     crypto_auth_hmacsha256_final(&state, output);
 }
