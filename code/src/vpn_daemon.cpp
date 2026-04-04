@@ -45,7 +45,7 @@ bool VpnDaemon::start(const Config& config) {
     tun_thread_ = std::thread(&VpnDaemon::tun_to_udp, this);
     udp_thread_ = std::thread(&VpnDaemon::udp_to_tun, this);
 
-    std::cout << "tunnel established, forwarding traffic\n";
+    std::cout << "tunnel established, forwarding traffic" << std::endl;
     return true;
 }
 
@@ -57,7 +57,7 @@ void VpnDaemon::wait() {
 void VpnDaemon::stop() {
     if (!running_.exchange(false)) return;
 
-    std::cout << "shutting down...\n";
+    std::cout << "shutting down..." << std::endl;
     tun_.close();
     if (udp_fd_ >= 0) {
         ::close(udp_fd_);
@@ -126,7 +126,7 @@ bool VpnDaemon::setup_udp(const Config& config) {
                       << config.listen_port() << "\n";
             return false;
         }
-        std::cout << "listening on UDP :" << config.listen_port() << "\n";
+        std::cout << "listening on UDP :" << config.listen_port() << "" << std::endl;
     }
 
     // For client, resolve server endpoint
@@ -175,7 +175,7 @@ bool VpnDaemon::perform_handshake(const Config& config) {
 
         sendto(udp_fd_, buf, 1 + msg_len, 0,
                reinterpret_cast<struct sockaddr*>(&peer_addr_), peer_addr_len_);
-        std::cout << "handshake msg1 sent\n";
+        std::cout << "handshake msg1 sent" << std::endl;
 
         // Wait for msg2 with timeout + retry
         struct timeval tv{5, 0};
@@ -190,7 +190,7 @@ bool VpnDaemon::perform_handshake(const Config& config) {
                     std::cerr << "error: invalid handshake msg2\n";
                     return false;
                 }
-                std::cout << "handshake msg2 received\n";
+                std::cout << "handshake msg2 received" << std::endl;
 
                 uint8_t sk[32], rk[32];
                 hs.split(sk, rk);
@@ -205,7 +205,7 @@ bool VpnDaemon::perform_handshake(const Config& config) {
             }
 
             if (attempt < 2) {
-                std::cout << "retrying handshake...\n";
+                std::cout << "retrying handshake..." << std::endl;
                 sendto(udp_fd_, buf, 1 + msg_len, 0,
                        reinterpret_cast<struct sockaddr*>(&peer_addr_),
                        peer_addr_len_);
@@ -217,7 +217,7 @@ bool VpnDaemon::perform_handshake(const Config& config) {
 
     } else {
         // Server: responder — wait for client's msg1
-        std::cout << "waiting for handshake...\n";
+        std::cout << "waiting for handshake..." << std::endl;
 
         uint8_t buf[256];
         ssize_t n = recvfrom(udp_fd_, buf, sizeof(buf), 0,
@@ -267,7 +267,7 @@ bool VpnDaemon::perform_handshake(const Config& config) {
 
         sendto(udp_fd_, buf, 1 + msg_len, 0,
                reinterpret_cast<struct sockaddr*>(&peer_addr_), peer_addr_len_);
-        std::cout << "handshake msg2 sent\n";
+        std::cout << "handshake msg2 sent" << std::endl;
 
         uint8_t sk[32], rk[32];
         hs.split(sk, rk);
