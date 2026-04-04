@@ -34,6 +34,13 @@ KeyPair KeyPair::generate() {
     return kp;
 }
 
+KeyPair KeyPair::from_private_key(const uint8_t* priv) {
+    KeyPair kp;
+    std::memcpy(kp.priv_, priv, KEY_SIZE);
+    crypto_scalarmult_base(kp.pub_, kp.priv_);
+    return kp;
+}
+
 bool KeyPair::is_valid() const {
     uint8_t zero[KEY_SIZE]{};
     return sodium_memcmp(priv_, zero, KEY_SIZE) != 0;
