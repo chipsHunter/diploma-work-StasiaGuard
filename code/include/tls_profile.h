@@ -21,6 +21,12 @@ public:
                           bool is_initiator) override;
 
 private:
+    static size_t write_fake_server_handshake(uint8_t* out,
+                                              const uint8_t* noise_tag,
+                                              size_t tag_len);
+    static size_t write_fake_client_finished(uint8_t* out);
+
     uint8_t client_session_id_[32];
     size_t  client_session_id_len_;
+    bool    need_client_finished_;
 };
