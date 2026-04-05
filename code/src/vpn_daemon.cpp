@@ -2,6 +2,7 @@
 #include "crypto_engine.h"
 #include "noise_handshake.h"
 #include "packet.h"
+#include "tls_record_builder.h"
 
 #include <arpa/inet.h>
 #include <cstring>
@@ -14,7 +15,14 @@
 VpnDaemon::VpnDaemon()
     : udp_fd_(-1)
     , running_(false)
-    , role_(Config::Role::CLIENT) {
+    , role_(Config::Role::CLIENT)
+    , use_tls_(false) {
+}
+
+std::shared_ptr<TrafficProfile> VpnDaemon::make_profile() {
+    if (use_tls_)
+        return std::make_shared<TlsProfile>();
+    return nullptr;
 }
 
 VpnDaemon::~VpnDaemon() {
@@ -40,6 +48,9 @@ bool VpnDaemon::start(const Config& config) {
               << Config::base64_encode(key_store_.public_key(), 32) << std::endl;
 
     peer_registry_.load(config.peers());
+    use_tls_ = (config.traffic_profile() == "tls");
+    if (use_tls_)
+        std::cout << "traffic profile: TLS 1.3 mimicry" << std::endl;
 
     if (!setup_tun(config)) return false;
     if (!setup_udp(config)) return false;
@@ -152,56 +163,86 @@ bool VpnDaemon::setup_udp(const Config& config) {
 
 bool VpnDaemon::perform_handshake(const Config& config) {
     const auto& peer = config.peers()[0];
+    auto profile = make_profile();
 
     NoiseHandshake hs(NoiseHandshake::Role::INITIATOR,
                       key_store_.private_key(),
                       key_store_.public_key(),
                       peer.public_key);
 
-    uint8_t buf[256];
-    buf[0] = MSG_HANDSHAKE1;
-    size_t msg_len;
-    if (!hs.write_message1(buf + 1, &msg_len)) {
+    uint8_t noise_buf[256], send_buf[2048];
+    size_t noise_len;
+    if (!hs.write_message1(noise_buf, &noise_len)) {
         std::cerr << "error: failed to create handshake msg1" << std::endl;
         return false;
     }
 
-    sendto(udp_fd_, buf, 1 + msg_len, 0,
+    size_t send_len;
+    if (profile) {
+        send_len = profile->wrap_handshake(send_buf, noise_buf, noise_len, true);
+    } else {
+        send_buf[0] = MSG_HANDSHAKE1;
+        std::memcpy(send_buf + 1, noise_buf, noise_len);
+        send_len = 1 + noise_len;
+    }
+
+    sendto(udp_fd_, send_buf, send_len, 0,
            reinterpret_cast<struct sockaddr*>(&server_addr_), server_addr_len_);
     std::cout << "handshake msg1 sent" << std::endl;
 
     struct timeval tv{5, 0};
     setsockopt(udp_fd_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
+    uint8_t recv_buf[4096];
     for (int attempt = 0; attempt < 3; attempt++) {
         struct sockaddr_in from{};
         socklen_t from_len = sizeof(from);
-        ssize_t n = recvfrom(udp_fd_, buf, sizeof(buf), 0,
+        ssize_t n = recvfrom(udp_fd_, recv_buf, sizeof(recv_buf), 0,
                              reinterpret_cast<struct sockaddr*>(&from), &from_len);
-        if (n > 0 && buf[0] == MSG_HANDSHAKE2) {
-            if (!hs.read_message2(buf + 1, n - 1)) {
-                std::cerr << "error: invalid handshake msg2" << std::endl;
-                return false;
+        if (n <= 0) goto retry;
+
+        {
+            uint8_t noise_msg2[128];
+            size_t noise_msg2_len;
+            bool ok = false;
+
+            if (profile) {
+                ok = profile->unwrap_handshake(noise_msg2, &noise_msg2_len,
+                                               recv_buf, n, true);
+            } else if (recv_buf[0] == MSG_HANDSHAKE2) {
+                std::memcpy(noise_msg2, recv_buf + 1, n - 1);
+                noise_msg2_len = n - 1;
+                ok = true;
             }
-            std::cout << "handshake msg2 received" << std::endl;
 
-            uint8_t sk[32], rk[32];
-            hs.split(sk, rk);
-            session_mgr_.add(peer.allowed_ip,
-                             std::make_shared<Session>(sk, rk),
-                             server_addr_, server_addr_len_);
-            routing_table_.add(peer.allowed_ip, peer.allowed_ip);
-            sodium_memzero(sk, 32);
-            sodium_memzero(rk, 32);
+            if (ok && hs.read_message2(noise_msg2, noise_msg2_len)) {
+                std::cout << "handshake msg2 received" << std::endl;
 
-            tv = {0, 0};
-            setsockopt(udp_fd_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-            return true;
+                uint8_t sk[32], rk[32];
+                hs.split(sk, rk);
+
+                auto ps_profile = make_profile();
+                session_mgr_.add(peer.allowed_ip,
+                                 std::make_shared<Session>(sk, rk),
+                                 server_addr_, server_addr_len_);
+                // Attach profile to peer session
+                auto ps = session_mgr_.find_by_id(peer.allowed_ip);
+                if (ps) ps->profile = ps_profile;
+
+                routing_table_.add(peer.allowed_ip, peer.allowed_ip);
+                sodium_memzero(sk, 32);
+                sodium_memzero(rk, 32);
+
+                tv = {0, 0};
+                setsockopt(udp_fd_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+                return true;
+            }
         }
 
+    retry:
         if (attempt < 2) {
             std::cout << "retrying handshake..." << std::endl;
-            sendto(udp_fd_, buf, 1 + msg_len, 0,
+            sendto(udp_fd_, send_buf, send_len, 0,
                    reinterpret_cast<struct sockaddr*>(&server_addr_),
                    server_addr_len_);
         }
@@ -213,12 +254,27 @@ bool VpnDaemon::perform_handshake(const Config& config) {
 
 bool VpnDaemon::handle_handshake(const uint8_t* buf, ssize_t n,
                                  struct sockaddr_in& from, socklen_t from_len) {
+    auto profile = make_profile();
+
+    // Unwrap Noise msg1 from TLS ClientHello or raw format
+    uint8_t noise_msg1[128];
+    size_t noise_msg1_len;
+
+    if (profile) {
+        if (!profile->unwrap_handshake(noise_msg1, &noise_msg1_len,
+                                       buf, n, false))
+            return false;
+    } else {
+        std::memcpy(noise_msg1, buf + 1, n - 1);
+        noise_msg1_len = n - 1;
+    }
+
     NoiseHandshake hs(NoiseHandshake::Role::RESPONDER,
                       key_store_.private_key(),
                       key_store_.public_key(),
                       nullptr);
 
-    if (!hs.read_message1(buf + 1, n - 1)) {
+    if (!hs.read_message1(noise_msg1, noise_msg1_len)) {
         std::cerr << "error: invalid handshake msg1" << std::endl;
         return false;
     }
@@ -230,12 +286,22 @@ bool VpnDaemon::handle_handshake(const uint8_t* buf, ssize_t n,
         return false;
     }
 
-    uint8_t out[256];
-    out[0] = MSG_HANDSHAKE2;
-    size_t msg_len;
-    if (!hs.write_message2(out + 1, &msg_len)) return false;
+    uint8_t noise_msg2[128];
+    size_t msg2_len;
+    if (!hs.write_message2(noise_msg2, &msg2_len)) return false;
 
-    sendto(udp_fd_, out, 1 + msg_len, 0,
+    // Wrap response as TLS ServerHello or raw format
+    uint8_t send_buf[4096];
+    size_t send_len;
+    if (profile) {
+        send_len = profile->wrap_handshake(send_buf, noise_msg2, msg2_len, false);
+    } else {
+        send_buf[0] = MSG_HANDSHAKE2;
+        std::memcpy(send_buf + 1, noise_msg2, msg2_len);
+        send_len = 1 + msg2_len;
+    }
+
+    sendto(udp_fd_, send_buf, send_len, 0,
            reinterpret_cast<struct sockaddr*>(&from), from_len);
 
     uint8_t sk[32], rk[32];
@@ -243,15 +309,17 @@ bool VpnDaemon::handle_handshake(const uint8_t* buf, ssize_t n,
 
     auto existing = session_mgr_.find_by_id(matched->allowed_ip);
     if (existing) {
-        // Responder: delay send-side switch until client confirms
         session_mgr_.update_session(matched->allowed_ip,
                                     std::make_shared<Session>(sk, rk),
                                     false);
         session_mgr_.update_addr(matched->allowed_ip, from, from_len);
+        existing->profile = profile;
     } else {
         session_mgr_.add(matched->allowed_ip,
                          std::make_shared<Session>(sk, rk),
                          from, from_len);
+        auto ps = session_mgr_.find_by_id(matched->allowed_ip);
+        if (ps) ps->profile = profile;
         routing_table_.add(matched->allowed_ip, matched->allowed_ip);
     }
 
@@ -282,15 +350,24 @@ void VpnDaemon::initiate_rekey(const std::string& peer_id) {
         key_store_.public_key(),
         pi->public_key);
 
-    uint8_t buf[256];
-    buf[0] = MSG_HANDSHAKE1;
-    size_t msg_len;
-    if (!hs->write_message1(buf + 1, &msg_len)) return;
+    uint8_t noise_buf[128], send_buf[2048];
+    size_t noise_len;
+    if (!hs->write_message1(noise_buf, &noise_len)) return;
 
     auto ps = session_mgr_.find_by_id(peer_id);
     if (!ps) return;
 
-    sendto(udp_fd_, buf, 1 + msg_len, 0,
+    size_t send_len;
+    if (ps->profile) {
+        auto rekey_profile = make_profile();
+        send_len = rekey_profile->wrap_handshake(send_buf, noise_buf, noise_len, true);
+    } else {
+        send_buf[0] = MSG_HANDSHAKE1;
+        std::memcpy(send_buf + 1, noise_buf, noise_len);
+        send_len = 1 + noise_len;
+    }
+
+    sendto(udp_fd_, send_buf, send_len, 0,
            reinterpret_cast<struct sockaddr*>(&ps->addr), ps->addr_len);
 
     pending_rekey_ = std::move(hs);
@@ -303,7 +380,8 @@ void VpnDaemon::initiate_rekey(const std::string& peer_id) {
 // ---------------------------------------------------------------------------
 
 void VpnDaemon::tun_to_udp() {
-    uint8_t buf[Packet::MAX_SIZE + Session::OVERHEAD + 1];
+    uint8_t enc_buf[Packet::MAX_SIZE + Session::OVERHEAD + 1];
+    uint8_t send_buf[8192];
     struct pollfd pfd;
     pfd.fd = tun_.fd();
     pfd.events = POLLIN;
@@ -318,17 +396,14 @@ void VpnDaemon::tun_to_udp() {
         std::shared_ptr<PeerSession> ps;
 
         if (role_ == Config::Role::CLIENT) {
-            // Client: all traffic to server
-            auto pi = peer_registry_.all();
+            auto& pi = peer_registry_.all();
             if (!pi.empty())
                 ps = session_mgr_.find_by_id(pi[0].allowed_ip);
         } else {
-            // Server: route by dest IP
             struct in_addr dst;
             dst.s_addr = pkt.get_dest_ip();
             char dst_str[INET_ADDRSTRLEN];
             inet_ntop(AF_INET, &dst, dst_str, sizeof(dst_str));
-
             std::string peer_id = routing_table_.resolve(dst_str);
             if (!peer_id.empty())
                 ps = session_mgr_.find_by_id(peer_id);
@@ -338,18 +413,28 @@ void VpnDaemon::tun_to_udp() {
         auto send_sess = ps->send_session();
         if (!send_sess) continue;
 
-        buf[0] = MSG_DATA;
+        // Encrypt
         size_t enc_len;
-        if (!send_sess->encrypt(buf + 1, &enc_len, pkt.data(), pkt.length()))
+        if (!send_sess->encrypt(enc_buf, &enc_len, pkt.data(), pkt.length()))
             continue;
 
-        sendto(udp_fd_, buf, 1 + enc_len, 0,
+        // Wrap in TLS record or raw format
+        size_t send_len;
+        if (ps->profile) {
+            send_len = ps->profile->wrap(send_buf, enc_buf, enc_len);
+        } else {
+            send_buf[0] = MSG_DATA;
+            std::memcpy(send_buf + 1, enc_buf, enc_len);
+            send_len = 1 + enc_len;
+        }
+
+        sendto(udp_fd_, send_buf, send_len, 0,
                reinterpret_cast<struct sockaddr*>(&ps->addr), ps->addr_len);
     }
 }
 
 void VpnDaemon::udp_to_tun() {
-    uint8_t buf[2048];
+    uint8_t buf[8192];
     struct pollfd pfd;
     pfd.fd = udp_fd_;
     pfd.events = POLLIN;
@@ -365,20 +450,42 @@ void VpnDaemon::udp_to_tun() {
         if (n <= 0) break;
         if (n < 2) continue;
 
-        // Server: accept new/re-handshakes
-        if (buf[0] == MSG_HANDSHAKE1 && role_ == Config::Role::SERVER) {
+        uint8_t first_byte = buf[0];
+
+        // Detect message type: TLS content types (0x14-0x17) or raw (1-3)
+        bool is_tls_handshake = (first_byte == TlsRecordBuilder::CONTENT_HANDSHAKE);
+        bool is_tls_data = (first_byte == TlsRecordBuilder::CONTENT_APP_DATA);
+        bool is_raw_hs1 = (first_byte == MSG_HANDSHAKE1);
+        bool is_raw_hs2 = (first_byte == MSG_HANDSHAKE2);
+        bool is_raw_data = (first_byte == MSG_DATA);
+
+        // Server: accept handshakes (TLS or raw)
+        if ((is_tls_handshake || is_raw_hs1) && role_ == Config::Role::SERVER) {
             handle_handshake(buf, n, from, from_len);
             continue;
         }
 
-        // Client: complete pending rekey
-        if (buf[0] == MSG_HANDSHAKE2 && role_ == Config::Role::CLIENT) {
+        // Client: complete pending rekey (TLS or raw)
+        if ((is_tls_handshake || is_raw_hs2) && role_ == Config::Role::CLIENT) {
             std::lock_guard<std::mutex> lock(rekey_mutex_);
             if (pending_rekey_) {
-                if (pending_rekey_->read_message2(buf + 1, n - 1)) {
+                uint8_t noise_msg2[128];
+                size_t noise_len;
+                bool ok = false;
+
+                if (is_tls_handshake) {
+                    TlsProfile tmp;
+                    ok = tmp.unwrap_handshake(noise_msg2, &noise_len,
+                                              buf, n, true);
+                } else {
+                    std::memcpy(noise_msg2, buf + 1, n - 1);
+                    noise_len = n - 1;
+                    ok = true;
+                }
+
+                if (ok && pending_rekey_->read_message2(noise_msg2, noise_len)) {
                     uint8_t sk[32], rk[32];
                     pending_rekey_->split(sk, rk);
-                    // Initiator: switch send immediately
                     session_mgr_.update_session(rekey_peer_id_,
                                                 std::make_shared<Session>(sk, rk),
                                                 true);
@@ -392,23 +499,37 @@ void VpnDaemon::udp_to_tun() {
             continue;
         }
 
-        if (buf[0] != MSG_DATA) continue;
+        if (!is_tls_data && !is_raw_data) continue;
 
-        // Find session
+        // Find peer session
         std::shared_ptr<PeerSession> ps;
         if (role_ == Config::Role::CLIENT) {
-            auto pi = peer_registry_.all();
+            auto& pi = peer_registry_.all();
             if (!pi.empty())
                 ps = session_mgr_.find_by_id(pi[0].allowed_ip);
         } else {
             ps = session_mgr_.find_by_addr(from);
         }
-
         if (!ps) continue;
 
+        // Unwrap TLS record or strip raw header
+        uint8_t enc_data[8192];
+        size_t enc_len;
+
+        if (ps->profile && is_tls_data) {
+            if (!ps->profile->unwrap(enc_data, &enc_len, buf, n))
+                continue;
+        } else if (is_raw_data) {
+            std::memcpy(enc_data, buf + 1, n - 1);
+            enc_len = n - 1;
+        } else {
+            continue;
+        }
+
+        // Decrypt
         uint8_t plaintext[2048];
         size_t pt_len;
-        if (!ps->try_decrypt(plaintext, &pt_len, buf + 1, n - 1))
+        if (!ps->try_decrypt(plaintext, &pt_len, enc_data, enc_len))
             continue;
 
         Packet pkt;

@@ -11,6 +11,9 @@ add_library(vpn-core
     peer_registry.cpp
     routing_table.cpp
     session_manager.cpp
+    tls_record_builder.cpp
+    padding_calculator.cpp
+    tls_profile.cpp
     vpn_daemon.cpp
 )
 
