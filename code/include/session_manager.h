@@ -1,6 +1,7 @@
 #pragma once
 
 #include "session.h"
+#include "traffic_profile.h"
 
 #include <atomic>
 #include <functional>
@@ -12,9 +13,10 @@
 #include <thread>
 
 struct PeerSession {
-    std::shared_ptr<Session> session;       // current (recv always, send when confirmed)
-    std::shared_ptr<Session> prev_session;  // previous (recv fallback, send until confirmed)
-    bool send_confirmed = true;             // false on responder during rekey transition
+    std::shared_ptr<Session> session;
+    std::shared_ptr<Session> prev_session;
+    bool send_confirmed = true;
+    std::shared_ptr<TrafficProfile> profile;  // TLS wrapping (nullptr = raw)
     struct sockaddr_in addr{};
     socklen_t addr_len = sizeof(struct sockaddr_in);
 

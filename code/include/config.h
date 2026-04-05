@@ -18,6 +18,7 @@ public:
     int tun_mask() const { return tun_mask_; }
     const std::string& private_key_path() const { return private_key_path_; }
     const std::vector<PeerInfo>& peers() const { return peers_; }
+    const std::string& traffic_profile() const { return traffic_profile_; }
 
     static bool base64_decode(const std::string& b64,
                               uint8_t* out, size_t expected_len);
@@ -30,4 +31,5 @@ private:
     int tun_mask_ = 24;
     std::string private_key_path_;
     std::vector<PeerInfo> peers_;
+    std::string traffic_profile_ = "none";
 };

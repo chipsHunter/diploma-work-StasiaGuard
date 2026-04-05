@@ -28,6 +28,7 @@ bool Config::load(const std::string& path) {
     tun_ip_ = root["tun_ip"].as<std::string>();
     tun_mask_ = root["tun_mask"].as<int>(24);
     private_key_path_ = root["private_key_path"].as<std::string>();
+    traffic_profile_ = root["traffic_profile"].as<std::string>("none");
 
     if (root["peers"]) {
         for (const auto& peer_node : root["peers"]) {
