@@ -193,7 +193,7 @@ bool VpnDaemon::perform_handshake(const Config& config) {
     struct timeval tv{5, 0};
     setsockopt(udp_fd_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
-    uint8_t recv_buf[2048];
+    uint8_t recv_buf[4096];
     for (int attempt = 0; attempt < 3; attempt++) {
         struct sockaddr_in from{};
         socklen_t from_len = sizeof(from);
@@ -291,7 +291,7 @@ bool VpnDaemon::handle_handshake(const uint8_t* buf, ssize_t n,
     if (!hs.write_message2(noise_msg2, &msg2_len)) return false;
 
     // Wrap response as TLS ServerHello or raw format
-    uint8_t send_buf[2048];
+    uint8_t send_buf[4096];
     size_t send_len;
     if (profile) {
         send_len = profile->wrap_handshake(send_buf, noise_msg2, msg2_len, false);
