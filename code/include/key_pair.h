@@ -17,6 +17,7 @@ public:
     KeyPair& operator=(KeyPair&& other) noexcept;
 
     static KeyPair generate();
+    static KeyPair from_private_key(const uint8_t* priv);
 
     const uint8_t* public_key() const { return pub_; }
     const uint8_t* private_key() const { return priv_; }
