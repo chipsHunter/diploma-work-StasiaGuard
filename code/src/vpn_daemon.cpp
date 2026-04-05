@@ -1,5 +1,6 @@
 #include "vpn_daemon.h"
 #include "crypto_engine.h"
+#include "metrics.h"
 #include "noise_handshake.h"
 #include "packet.h"
 #include "tls_record_builder.h"
@@ -73,6 +74,10 @@ bool VpnDaemon::start(const Config& config) {
     tun_thread_ = std::thread(&VpnDaemon::tun_to_udp, this);
     udp_thread_ = std::thread(&VpnDaemon::udp_to_tun, this);
 
+    // Start IPC server
+    ipc_.set_stop_callback([this]() { stop(); });
+    ipc_.start("/var/run/vpn.sock", this);
+
     if (role_ == Config::Role::SERVER)
         std::cout << "server ready, waiting for clients" << std::endl;
     else
@@ -89,6 +94,7 @@ void VpnDaemon::stop() {
     if (!running_.exchange(false)) return;
 
     std::cout << "shutting down..." << std::endl;
+    ipc_.stop();
     session_mgr_.stop_rekey_timer();
     tun_.close();
     if (udp_fd_ >= 0) {
@@ -275,6 +281,7 @@ bool VpnDaemon::handle_handshake(const uint8_t* buf, ssize_t n,
                       nullptr);
 
     if (!hs.read_message1(noise_msg1, noise_msg1_len)) {
+        global_metrics().handshakes_failed.fetch_add(1);
         std::cerr << "error: invalid handshake msg1" << std::endl;
         return false;
     }
@@ -328,6 +335,9 @@ bool VpnDaemon::handle_handshake(const uint8_t* buf, ssize_t n,
 
     char addr_str[INET_ADDRSTRLEN];
     inet_ntop(AF_INET, &from.sin_addr, addr_str, sizeof(addr_str));
+    global_metrics().handshakes_total.fetch_add(1);
+    global_metrics().active_peers.store(session_mgr_.count());
+
     std::cout << "peer " << matched->allowed_ip << " connected from "
               << addr_str << ":" << ntohs(from.sin_port) << std::endl;
     return true;
@@ -430,6 +440,12 @@ void VpnDaemon::tun_to_udp() {
 
         sendto(udp_fd_, send_buf, send_len, 0,
                reinterpret_cast<struct sockaddr*>(&ps->addr), ps->addr_len);
+
+        auto& m = global_metrics();
+        m.packets_sent.fetch_add(1);
+        m.bytes_sent.fetch_add(pkt.length());
+        if (ps->profile)
+            m.padding_overhead_bytes.fetch_add(send_len - enc_len - 5);
     }
 }
 
@@ -491,6 +507,7 @@ void VpnDaemon::udp_to_tun() {
                                                 true);
                     sodium_memzero(sk, 32);
                     sodium_memzero(rk, 32);
+                    global_metrics().rekeys_total.fetch_add(1);
                     std::cout << "rekey completed for "
                               << rekey_peer_id_ << std::endl;
                 }
@@ -529,8 +546,13 @@ void VpnDaemon::udp_to_tun() {
         // Decrypt
         uint8_t plaintext[2048];
         size_t pt_len;
-        if (!ps->try_decrypt(plaintext, &pt_len, enc_data, enc_len))
+        if (!ps->try_decrypt(plaintext, &pt_len, enc_data, enc_len)) {
+            global_metrics().decrypt_errors.fetch_add(1);
             continue;
+        }
+
+        global_metrics().packets_received.fetch_add(1);
+        global_metrics().bytes_received.fetch_add(pt_len);
 
         Packet pkt;
         std::memcpy(pkt.data(), plaintext, pt_len);
