@@ -2,6 +2,29 @@
 
 #include <iostream>
 
+// ---------------------------------------------------------------------------
+// PeerSession — dual-session decrypt for safe rekey transition
+// ---------------------------------------------------------------------------
+
+bool PeerSession::try_decrypt(uint8_t* out, size_t* out_len,
+                              const uint8_t* ct, size_t ct_len) {
+    // Try current session first
+    if (session && session->decrypt(out, out_len, ct, ct_len)) {
+        if (!send_confirmed) {
+            send_confirmed = true; // peer has switched → safe to send with new keys
+        }
+        return true;
+    }
+    // Fallback to previous session (peer hasn't switched yet)
+    if (prev_session && prev_session->decrypt(out, out_len, ct, ct_len))
+        return true;
+    return false;
+}
+
+// ---------------------------------------------------------------------------
+// SessionManager
+// ---------------------------------------------------------------------------
+
 SessionManager::SessionManager() : timer_running_(false) {}
 
 SessionManager::~SessionManager() {
@@ -28,6 +51,7 @@ void SessionManager::add(const std::string& peer_id,
                          const struct sockaddr_in& addr, socklen_t addr_len) {
     auto ps = std::make_shared<PeerSession>();
     ps->session = std::move(session);
+    ps->send_confirmed = true;
     ps->addr = addr;
     ps->addr_len = addr_len;
 
@@ -36,11 +60,17 @@ void SessionManager::add(const std::string& peer_id,
 }
 
 void SessionManager::update_session(const std::string& peer_id,
-                                    std::shared_ptr<Session> session) {
+                                    std::shared_ptr<Session> session,
+                                    bool initiator) {
     std::lock_guard<std::mutex> lock(mutex_);
     auto it = sessions_.find(peer_id);
-    if (it != sessions_.end())
-        it->second->session = std::move(session);
+    if (it != sessions_.end()) {
+        auto& ps = it->second;
+        ps->prev_session = ps->session;        // old → fallback for recv
+        ps->session = std::move(session);      // new → primary for recv
+        ps->send_confirmed = initiator;        // initiator switches send immediately;
+                                               // responder waits for confirmation
+    }
 }
 
 void SessionManager::update_addr(const std::string& peer_id,

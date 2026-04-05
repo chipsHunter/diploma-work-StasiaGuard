@@ -243,8 +243,10 @@ bool VpnDaemon::handle_handshake(const uint8_t* buf, ssize_t n,
 
     auto existing = session_mgr_.find_by_id(matched->allowed_ip);
     if (existing) {
+        // Responder: delay send-side switch until client confirms
         session_mgr_.update_session(matched->allowed_ip,
-                                    std::make_shared<Session>(sk, rk));
+                                    std::make_shared<Session>(sk, rk),
+                                    false);
         session_mgr_.update_addr(matched->allowed_ip, from, from_len);
     } else {
         session_mgr_.add(matched->allowed_ip,
@@ -332,11 +334,13 @@ void VpnDaemon::tun_to_udp() {
                 ps = session_mgr_.find_by_id(peer_id);
         }
 
-        if (!ps || !ps->session) continue;
+        if (!ps) continue;
+        auto send_sess = ps->send_session();
+        if (!send_sess) continue;
 
         buf[0] = MSG_DATA;
         size_t enc_len;
-        if (!ps->session->encrypt(buf + 1, &enc_len, pkt.data(), pkt.length()))
+        if (!send_sess->encrypt(buf + 1, &enc_len, pkt.data(), pkt.length()))
             continue;
 
         sendto(udp_fd_, buf, 1 + enc_len, 0,
@@ -374,8 +378,10 @@ void VpnDaemon::udp_to_tun() {
                 if (pending_rekey_->read_message2(buf + 1, n - 1)) {
                     uint8_t sk[32], rk[32];
                     pending_rekey_->split(sk, rk);
+                    // Initiator: switch send immediately
                     session_mgr_.update_session(rekey_peer_id_,
-                                                std::make_shared<Session>(sk, rk));
+                                                std::make_shared<Session>(sk, rk),
+                                                true);
                     sodium_memzero(sk, 32);
                     sodium_memzero(rk, 32);
                     std::cout << "rekey completed for "
@@ -398,11 +404,11 @@ void VpnDaemon::udp_to_tun() {
             ps = session_mgr_.find_by_addr(from);
         }
 
-        if (!ps || !ps->session) continue;
+        if (!ps) continue;
 
         uint8_t plaintext[2048];
         size_t pt_len;
-        if (!ps->session->decrypt(plaintext, &pt_len, buf + 1, n - 1))
+        if (!ps->try_decrypt(plaintext, &pt_len, buf + 1, n - 1))
             continue;
 
         Packet pkt;
