@@ -6,6 +6,8 @@ add_library(vpn-core
     tun_device.cpp
     noise_handshake.cpp
     session.cpp
+    config.cpp
+    vpn_daemon.cpp
 )
 
 target_include_directories(vpn-core PUBLIC ${PROJECT_SOURCE_DIR}/include)
