@@ -50,6 +50,16 @@ bool VpnDaemon::start(const Config& config) {
     return true;
 }
 
+std::shared_ptr<Session> VpnDaemon::get_session() {
+    std::lock_guard<std::mutex> lock(session_mutex_);
+    return session_;
+}
+
+void VpnDaemon::set_session(std::shared_ptr<Session> s) {
+    std::lock_guard<std::mutex> lock(session_mutex_);
+    session_ = std::move(s);
+}
+
 void VpnDaemon::wait() {
     if (tun_thread_.joinable()) tun_thread_.join();
     if (udp_thread_.joinable()) udp_thread_.join();
@@ -195,7 +205,7 @@ bool VpnDaemon::perform_handshake(const Config& config) {
 
                 uint8_t sk[32], rk[32];
                 hs.split(sk, rk);
-                session_ = std::make_unique<Session>(sk, rk);
+                set_session(std::make_shared<Session>(sk, rk));
                 sodium_memzero(sk, 32);
                 sodium_memzero(rk, 32);
 
@@ -272,12 +282,56 @@ bool VpnDaemon::perform_handshake(const Config& config) {
 
         uint8_t sk[32], rk[32];
         hs.split(sk, rk);
-        session_ = std::make_unique<Session>(sk, rk);
+        set_session(std::make_shared<Session>(sk, rk));
         sodium_memzero(sk, 32);
         sodium_memzero(rk, 32);
 
         return true;
     }
+}
+
+bool VpnDaemon::handle_rehandshake(const uint8_t* buf, ssize_t n,
+                                   struct sockaddr_in& from, socklen_t from_len) {
+    NoiseHandshake hs(NoiseHandshake::Role::RESPONDER,
+                      local_static_.private_key(),
+                      local_static_.public_key(),
+                      nullptr);
+
+    if (!hs.read_message1(buf + 1, n - 1)) {
+        std::cerr << "error: invalid re-handshake msg1" << std::endl;
+        return false;
+    }
+
+    if (std::memcmp(hs.remote_static_public_key(), peer_public_key_, 32) != 0) {
+        std::cerr << "error: re-handshake from unknown peer" << std::endl;
+        return false;
+    }
+
+    uint8_t out[256];
+    out[0] = MSG_HANDSHAKE2;
+    size_t msg_len;
+    if (!hs.write_message2(out + 1, &msg_len)) return false;
+
+    sendto(udp_fd_, out, 1 + msg_len, 0,
+           reinterpret_cast<struct sockaddr*>(&from), from_len);
+
+    uint8_t sk[32], rk[32];
+    hs.split(sk, rk);
+    set_session(std::make_shared<Session>(sk, rk));
+    sodium_memzero(sk, 32);
+    sodium_memzero(rk, 32);
+
+    {
+        std::lock_guard<std::mutex> lock(addr_mutex_);
+        peer_addr_ = from;
+        peer_addr_len_ = from_len;
+    }
+
+    char addr_str[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &from.sin_addr, addr_str, sizeof(addr_str));
+    std::cout << "re-handshake from " << addr_str
+              << ":" << ntohs(from.sin_port) << std::endl;
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -297,13 +351,23 @@ void VpnDaemon::tun_to_udp() {
         Packet pkt;
         if (!tun_.read_packet(pkt)) break;
 
+        auto sess = get_session();
+        if (!sess) continue;
+
         buf[0] = MSG_DATA;
         size_t enc_len;
-        if (!session_->encrypt(buf + 1, &enc_len, pkt.data(), pkt.length()))
+        if (!sess->encrypt(buf + 1, &enc_len, pkt.data(), pkt.length()))
             continue;
 
+        struct sockaddr_in addr;
+        socklen_t addr_len;
+        {
+            std::lock_guard<std::mutex> lock(addr_mutex_);
+            addr = peer_addr_;
+            addr_len = peer_addr_len_;
+        }
         sendto(udp_fd_, buf, 1 + enc_len, 0,
-               reinterpret_cast<struct sockaddr*>(&peer_addr_), peer_addr_len_);
+               reinterpret_cast<struct sockaddr*>(&addr), addr_len);
     }
 }
 
@@ -322,12 +386,21 @@ void VpnDaemon::udp_to_tun() {
         ssize_t n = recvfrom(udp_fd_, buf, sizeof(buf), 0,
                              reinterpret_cast<struct sockaddr*>(&from), &from_len);
         if (n <= 0) break;
+        if (n < 2) continue;
 
-        if (buf[0] != MSG_DATA || n < 2) continue;
+        if (buf[0] == MSG_HANDSHAKE1 && role_ == Config::Role::SERVER) {
+            handle_rehandshake(buf, n, from, from_len);
+            continue;
+        }
+
+        if (buf[0] != MSG_DATA) continue;
+
+        auto sess = get_session();
+        if (!sess) continue;
 
         uint8_t plaintext[2048];
         size_t pt_len;
-        if (!session_->decrypt(plaintext, &pt_len, buf + 1, n - 1))
+        if (!sess->decrypt(plaintext, &pt_len, buf + 1, n - 1))
             continue;
 
         Packet pkt;
