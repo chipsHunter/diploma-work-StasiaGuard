@@ -1,6 +1,7 @@
 #pragma once
 
 #include "config.h"
+#include "ipc_server.h"
 #include "key_store.h"
 #include "peer_registry.h"
 #include "routing_table.h"
@@ -68,6 +69,7 @@ private:
 
     Config::Role role_;
     bool use_tls_;
+    IpcServer ipc_;
 
     std::shared_ptr<TrafficProfile> make_profile();
 };

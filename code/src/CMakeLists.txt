@@ -14,6 +14,8 @@ add_library(vpn-core
     tls_record_builder.cpp
     padding_calculator.cpp
     tls_profile.cpp
+    metrics.cpp
+    ipc_server.cpp
     vpn_daemon.cpp
 )
 
