@@ -7,6 +7,7 @@
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <poll.h>
 #include <sodium.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -285,8 +286,14 @@ bool VpnDaemon::perform_handshake(const Config& config) {
 
 void VpnDaemon::tun_to_udp() {
     uint8_t buf[Packet::MAX_SIZE + Session::OVERHEAD + 1];
+    struct pollfd pfd;
+    pfd.fd = tun_.fd();
+    pfd.events = POLLIN;
 
     while (running_) {
+        int ret = poll(&pfd, 1, 500);
+        if (ret <= 0) continue;
+
         Packet pkt;
         if (!tun_.read_packet(pkt)) break;
 
@@ -302,8 +309,14 @@ void VpnDaemon::tun_to_udp() {
 
 void VpnDaemon::udp_to_tun() {
     uint8_t buf[2048];
+    struct pollfd pfd;
+    pfd.fd = udp_fd_;
+    pfd.events = POLLIN;
 
     while (running_) {
+        int ret = poll(&pfd, 1, 500);
+        if (ret <= 0) continue;
+
         struct sockaddr_in from{};
         socklen_t from_len = sizeof(from);
         ssize_t n = recvfrom(udp_fd_, buf, sizeof(buf), 0,
