@@ -5,7 +5,6 @@
 
 #include <arpa/inet.h>
 #include <cstring>
-#include <fstream>
 #include <iostream>
 #include <poll.h>
 #include <sodium.h>
@@ -28,24 +27,38 @@ VpnDaemon::~VpnDaemon() {
 
 bool VpnDaemon::start(const Config& config) {
     role_ = config.role();
-    peer_configs_ = config.peers();
 
     if (!CryptoEngine::init()) {
         std::cerr << "error: failed to init libsodium" << std::endl;
         return false;
     }
 
-    if (!load_keys(config))  return false;
-    if (!setup_tun(config))  return false;
-    if (!setup_udp(config))  return false;
+    if (!key_store_.load_private_key(config.private_key_path()))
+        return false;
 
-    // Client performs handshake before starting threads.
-    // Server starts threads immediately — handshakes arrive via UDP.
+    std::cout << "local public key: "
+              << Config::base64_encode(key_store_.public_key(), 32) << std::endl;
+
+    peer_registry_.load(config.peers());
+
+    if (!setup_tun(config)) return false;
+    if (!setup_udp(config)) return false;
+
     if (role_ == Config::Role::CLIENT) {
         if (!perform_handshake(config)) return false;
     }
 
+    // Set up rekey callback (client initiates, server just accepts)
+    session_mgr_.set_rekey_callback([this](const std::string& peer_id) {
+        if (role_ == Config::Role::CLIENT)
+            initiate_rekey(peer_id);
+        else
+            std::cout << "rekey pending for peer " << peer_id
+                      << " (waiting for client)" << std::endl;
+    });
+
     running_ = true;
+    session_mgr_.start_rekey_timer();
     tun_thread_ = std::thread(&VpnDaemon::tun_to_udp, this);
     udp_thread_ = std::thread(&VpnDaemon::udp_to_tun, this);
 
@@ -65,6 +78,7 @@ void VpnDaemon::stop() {
     if (!running_.exchange(false)) return;
 
     std::cout << "shutting down..." << std::endl;
+    session_mgr_.stop_rekey_timer();
     tun_.close();
     if (udp_fd_ >= 0) {
         ::close(udp_fd_);
@@ -73,63 +87,18 @@ void VpnDaemon::stop() {
 }
 
 // ---------------------------------------------------------------------------
-// Peer lookup helpers
-// ---------------------------------------------------------------------------
-
-std::shared_ptr<PeerState> VpnDaemon::find_peer_by_ip(const std::string& ip) {
-    std::lock_guard<std::mutex> lock(peers_mutex_);
-    auto it = peers_.find(ip);
-    return (it != peers_.end()) ? it->second : nullptr;
-}
-
-std::shared_ptr<PeerState> VpnDaemon::find_peer_by_addr(const struct sockaddr_in& addr) {
-    std::lock_guard<std::mutex> lock(peers_mutex_);
-    for (auto& [ip, peer] : peers_) {
-        if (peer->addr.sin_addr.s_addr == addr.sin_addr.s_addr &&
-            peer->addr.sin_port == addr.sin_port)
-            return peer;
-    }
-    return nullptr;
-}
-
-// ---------------------------------------------------------------------------
 // Setup
 // ---------------------------------------------------------------------------
-
-bool VpnDaemon::load_keys(const Config& config) {
-    std::ifstream f(config.private_key_path());
-    if (!f) {
-        std::cerr << "error: cannot open private key: "
-                  << config.private_key_path() << std::endl;
-        return false;
-    }
-
-    std::string b64;
-    std::getline(f, b64);
-    uint8_t priv[32];
-    if (!Config::base64_decode(b64, priv, 32)) {
-        std::cerr << "error: invalid private key format" << std::endl;
-        return false;
-    }
-
-    local_static_ = KeyPair::from_private_key(priv);
-    sodium_memzero(priv, 32);
-
-    if (config.peers().empty()) {
-        std::cerr << "error: no peers configured" << std::endl;
-        return false;
-    }
-
-    std::cout << "local public key: "
-              << Config::base64_encode(local_static_.public_key(), 32) << std::endl;
-    return true;
-}
 
 bool VpnDaemon::setup_tun(const Config& config) {
     if (!tun_.open("tun0")) return false;
     tun_.configure(config.tun_ip(), config.tun_mask());
     std::cout << "tun0: " << config.tun_ip() << "/"
               << config.tun_mask() << std::endl;
+
+    if (role_ == Config::Role::SERVER)
+        system("sysctl -w net.ipv4.ip_forward=1 > /dev/null 2>&1");
+
     return true;
 }
 
@@ -159,7 +128,7 @@ bool VpnDaemon::setup_udp(const Config& config) {
         const std::string& ep = config.peers()[0].endpoint;
         auto colon = ep.rfind(':');
         if (colon == std::string::npos) {
-            std::cerr << "error: invalid endpoint format (expected ip:port)" << std::endl;
+            std::cerr << "error: invalid endpoint (expected ip:port)" << std::endl;
             return false;
         }
         std::string host = ep.substr(0, colon);
@@ -182,11 +151,12 @@ bool VpnDaemon::setup_udp(const Config& config) {
 // ---------------------------------------------------------------------------
 
 bool VpnDaemon::perform_handshake(const Config& config) {
-    // Client-only: initiate handshake with server
+    const auto& peer = config.peers()[0];
+
     NoiseHandshake hs(NoiseHandshake::Role::INITIATOR,
-                      local_static_.private_key(),
-                      local_static_.public_key(),
-                      config.peers()[0].public_key);
+                      key_store_.private_key(),
+                      key_store_.public_key(),
+                      peer.public_key);
 
     uint8_t buf[256];
     buf[0] = MSG_HANDSHAKE1;
@@ -217,19 +187,10 @@ bool VpnDaemon::perform_handshake(const Config& config) {
 
             uint8_t sk[32], rk[32];
             hs.split(sk, rk);
-
-            auto peer = std::make_shared<PeerState>();
-            peer->session = std::make_shared<Session>(sk, rk);
-            peer->addr = server_addr_;
-            peer->addr_len = server_addr_len_;
-            std::memcpy(peer->public_key, config.peers()[0].public_key, 32);
-            peer->allowed_ip = config.peers()[0].allowed_ip;
-
-            {
-                std::lock_guard<std::mutex> lock(peers_mutex_);
-                peers_[peer->allowed_ip] = peer;
-            }
-
+            session_mgr_.add(peer.allowed_ip,
+                             std::make_shared<Session>(sk, rk),
+                             server_addr_, server_addr_len_);
+            routing_table_.add(peer.allowed_ip, peer.allowed_ip);
             sodium_memzero(sk, 32);
             sodium_memzero(rk, 32);
 
@@ -253,8 +214,8 @@ bool VpnDaemon::perform_handshake(const Config& config) {
 bool VpnDaemon::handle_handshake(const uint8_t* buf, ssize_t n,
                                  struct sockaddr_in& from, socklen_t from_len) {
     NoiseHandshake hs(NoiseHandshake::Role::RESPONDER,
-                      local_static_.private_key(),
-                      local_static_.public_key(),
+                      key_store_.private_key(),
+                      key_store_.public_key(),
                       nullptr);
 
     if (!hs.read_message1(buf + 1, n - 1)) {
@@ -262,14 +223,8 @@ bool VpnDaemon::handle_handshake(const uint8_t* buf, ssize_t n,
         return false;
     }
 
-    // Find matching peer config by public key
-    const PeerInfo* matched = nullptr;
-    for (const auto& pc : peer_configs_) {
-        if (std::memcmp(pc.public_key, hs.remote_static_public_key(), 32) == 0) {
-            matched = &pc;
-            break;
-        }
-    }
+    const PeerInfo* matched = peer_registry_.find_by_public_key(
+        hs.remote_static_public_key());
     if (!matched) {
         std::cerr << "error: unknown peer" << std::endl;
         return false;
@@ -286,16 +241,18 @@ bool VpnDaemon::handle_handshake(const uint8_t* buf, ssize_t n,
     uint8_t sk[32], rk[32];
     hs.split(sk, rk);
 
-    auto peer = std::make_shared<PeerState>();
-    peer->session = std::make_shared<Session>(sk, rk);
-    peer->addr = from;
-    peer->addr_len = from_len;
-    std::memcpy(peer->public_key, hs.remote_static_public_key(), 32);
-    peer->allowed_ip = matched->allowed_ip;
-
-    {
-        std::lock_guard<std::mutex> lock(peers_mutex_);
-        peers_[matched->allowed_ip] = peer;
+    auto existing = session_mgr_.find_by_id(matched->allowed_ip);
+    if (existing) {
+        // Responder: delay send-side switch until client confirms
+        session_mgr_.update_session(matched->allowed_ip,
+                                    std::make_shared<Session>(sk, rk),
+                                    false);
+        session_mgr_.update_addr(matched->allowed_ip, from, from_len);
+    } else {
+        session_mgr_.add(matched->allowed_ip,
+                         std::make_shared<Session>(sk, rk),
+                         from, from_len);
+        routing_table_.add(matched->allowed_ip, matched->allowed_ip);
     }
 
     sodium_memzero(sk, 32);
@@ -309,7 +266,40 @@ bool VpnDaemon::handle_handshake(const uint8_t* buf, ssize_t n,
 }
 
 // ---------------------------------------------------------------------------
-// Data forwarding threads
+// Rekey (client-initiated)
+// ---------------------------------------------------------------------------
+
+void VpnDaemon::initiate_rekey(const std::string& peer_id) {
+    std::lock_guard<std::mutex> lock(rekey_mutex_);
+    if (pending_rekey_) return;
+
+    const PeerInfo* pi = peer_registry_.find_by_allowed_ip(peer_id);
+    if (!pi) return;
+
+    auto hs = std::make_unique<NoiseHandshake>(
+        NoiseHandshake::Role::INITIATOR,
+        key_store_.private_key(),
+        key_store_.public_key(),
+        pi->public_key);
+
+    uint8_t buf[256];
+    buf[0] = MSG_HANDSHAKE1;
+    size_t msg_len;
+    if (!hs->write_message1(buf + 1, &msg_len)) return;
+
+    auto ps = session_mgr_.find_by_id(peer_id);
+    if (!ps) return;
+
+    sendto(udp_fd_, buf, 1 + msg_len, 0,
+           reinterpret_cast<struct sockaddr*>(&ps->addr), ps->addr_len);
+
+    pending_rekey_ = std::move(hs);
+    rekey_peer_id_ = peer_id;
+    std::cout << "rekey initiated for " << peer_id << std::endl;
+}
+
+// ---------------------------------------------------------------------------
+// Data forwarding
 // ---------------------------------------------------------------------------
 
 void VpnDaemon::tun_to_udp() {
@@ -325,31 +315,36 @@ void VpnDaemon::tun_to_udp() {
         Packet pkt;
         if (!tun_.read_packet(pkt)) break;
 
-        std::shared_ptr<PeerState> peer;
+        std::shared_ptr<PeerSession> ps;
 
         if (role_ == Config::Role::CLIENT) {
-            // Client: all traffic goes to the single peer (server)
-            std::lock_guard<std::mutex> lock(peers_mutex_);
-            if (!peers_.empty())
-                peer = peers_.begin()->second;
+            // Client: all traffic to server
+            auto pi = peer_registry_.all();
+            if (!pi.empty())
+                ps = session_mgr_.find_by_id(pi[0].allowed_ip);
         } else {
-            // Server: route by destination IP
+            // Server: route by dest IP
             struct in_addr dst;
             dst.s_addr = pkt.get_dest_ip();
             char dst_str[INET_ADDRSTRLEN];
             inet_ntop(AF_INET, &dst, dst_str, sizeof(dst_str));
-            peer = find_peer_by_ip(dst_str);
+
+            std::string peer_id = routing_table_.resolve(dst_str);
+            if (!peer_id.empty())
+                ps = session_mgr_.find_by_id(peer_id);
         }
 
-        if (!peer || !peer->session) continue;
+        if (!ps) continue;
+        auto send_sess = ps->send_session();
+        if (!send_sess) continue;
 
         buf[0] = MSG_DATA;
         size_t enc_len;
-        if (!peer->session->encrypt(buf + 1, &enc_len, pkt.data(), pkt.length()))
+        if (!send_sess->encrypt(buf + 1, &enc_len, pkt.data(), pkt.length()))
             continue;
 
         sendto(udp_fd_, buf, 1 + enc_len, 0,
-               reinterpret_cast<struct sockaddr*>(&peer->addr), peer->addr_len);
+               reinterpret_cast<struct sockaddr*>(&ps->addr), ps->addr_len);
     }
 }
 
@@ -370,29 +365,50 @@ void VpnDaemon::udp_to_tun() {
         if (n <= 0) break;
         if (n < 2) continue;
 
+        // Server: accept new/re-handshakes
         if (buf[0] == MSG_HANDSHAKE1 && role_ == Config::Role::SERVER) {
             handle_handshake(buf, n, from, from_len);
             continue;
         }
 
-        if (buf[0] != MSG_DATA) continue;
-
-        // Find session: by source address (server) or use single peer (client)
-        std::shared_ptr<PeerState> peer;
-
-        if (role_ == Config::Role::CLIENT) {
-            std::lock_guard<std::mutex> lock(peers_mutex_);
-            if (!peers_.empty())
-                peer = peers_.begin()->second;
-        } else {
-            peer = find_peer_by_addr(from);
+        // Client: complete pending rekey
+        if (buf[0] == MSG_HANDSHAKE2 && role_ == Config::Role::CLIENT) {
+            std::lock_guard<std::mutex> lock(rekey_mutex_);
+            if (pending_rekey_) {
+                if (pending_rekey_->read_message2(buf + 1, n - 1)) {
+                    uint8_t sk[32], rk[32];
+                    pending_rekey_->split(sk, rk);
+                    // Initiator: switch send immediately
+                    session_mgr_.update_session(rekey_peer_id_,
+                                                std::make_shared<Session>(sk, rk),
+                                                true);
+                    sodium_memzero(sk, 32);
+                    sodium_memzero(rk, 32);
+                    std::cout << "rekey completed for "
+                              << rekey_peer_id_ << std::endl;
+                }
+                pending_rekey_.reset();
+            }
+            continue;
         }
 
-        if (!peer || !peer->session) continue;
+        if (buf[0] != MSG_DATA) continue;
+
+        // Find session
+        std::shared_ptr<PeerSession> ps;
+        if (role_ == Config::Role::CLIENT) {
+            auto pi = peer_registry_.all();
+            if (!pi.empty())
+                ps = session_mgr_.find_by_id(pi[0].allowed_ip);
+        } else {
+            ps = session_mgr_.find_by_addr(from);
+        }
+
+        if (!ps) continue;
 
         uint8_t plaintext[2048];
         size_t pt_len;
-        if (!peer->session->decrypt(plaintext, &pt_len, buf + 1, n - 1))
+        if (!ps->try_decrypt(plaintext, &pt_len, buf + 1, n - 1))
             continue;
 
         Packet pkt;
