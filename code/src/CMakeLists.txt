@@ -7,6 +7,10 @@ add_library(vpn-core
     noise_handshake.cpp
     session.cpp
     config.cpp
+    key_store.cpp
+    peer_registry.cpp
+    routing_table.cpp
+    session_manager.cpp
     vpn_daemon.cpp
 )
 
