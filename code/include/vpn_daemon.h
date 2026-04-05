@@ -5,6 +5,7 @@
 #include "peer_registry.h"
 #include "routing_table.h"
 #include "session_manager.h"
+#include "tls_profile.h"
 #include "tun_device.h"
 
 #include <atomic>
@@ -66,4 +67,7 @@ private:
     std::thread udp_thread_;
 
     Config::Role role_;
+    bool use_tls_;
+
+    std::shared_ptr<TrafficProfile> make_profile();
 };
